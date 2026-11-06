@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #include <etherfabric/vi.h>
+#undef NDEBUG /* Assertions in tests must run even in Release builds. */
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>

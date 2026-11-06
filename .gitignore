@@ -6,3 +6,6 @@
 *.gcda
 *.gcno
 compile_commands.json
+/build-*/
+__pycache__/
+*.pyc

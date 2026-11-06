@@ -94,6 +94,9 @@ enum {
   EF_EVENT_TYPE_MAX
 };
 
+/* Supported software receive-discard reason. */
+enum { EF_EVENT_RX_DISCARD_TRUNC = 1 };
+
 enum {
   EF_EVENT_FLAG_SOP = 0x1,
   EF_EVENT_FLAG_CONT = 0x2,
@@ -151,6 +154,8 @@ typedef union ef_event {
 #define EF_EVENT_RX_CONT(ev)           ((ev).rx.flags & EF_EVENT_FLAG_CONT)
 #define EF_EVENT_RX_SOP(ev)            ((ev).rx.flags & EF_EVENT_FLAG_SOP)
 #define EF_EVENT_RX_DISCARD_TYPE(ev)   ((ev).rx_discard.subtype)
+#define EF_EVENT_RX_DISCARD_RQ_ID(ev)  ((ev).rx_discard.rq_id)
+#define EF_EVENT_RX_DISCARD_BYTES(ev)  ((ev).rx_discard.len)
 
 /* Internal ring counters follow unsigned modular arithmetic. */
 typedef struct ef_vi_rxq_state {
@@ -244,7 +249,7 @@ ef_vi_inline ef_addr ef_memreg_dma_addr(const ef_memreg *mr, size_t offset)
          (ef_addr) (offset & EF_VI_NIC_PAGE_MASK);
 }
 
-/* Commit 2: mock driver, protection domain, and memory registration. */
+/* Driver, protection domain, and memory registration. */
 int ef_driver_open(ef_driver_handle *out);
 int ef_driver_close(ef_driver_handle handle);
 int ef_pd_alloc(ef_pd *pd, ef_driver_handle pd_dh, int ifindex,
@@ -255,7 +260,7 @@ int ef_memreg_alloc(ef_memreg *mr, ef_driver_handle mr_dh,
                     void *memory, size_t bytes);
 int ef_memreg_free(ef_memreg *mr, ef_driver_handle mr_dh);
 
-/* Commit 3: VI allocation, filters, and receive descriptor posting. */
+/* VI allocation, filters, and receive descriptor posting. */
 int ef_vi_alloc_from_pd(ef_vi *vi, ef_driver_handle vi_dh,
                         ef_pd *pd, ef_driver_handle pd_dh,
                         int evq_capacity, int rxq_capacity, int txq_capacity,
@@ -271,7 +276,7 @@ int ef_vi_receive_init(ef_vi *vi, ef_addr addr, ef_request_id request_id);
 void ef_vi_receive_push(ef_vi *vi);
 int ef_vi_receive_post(ef_vi *vi, ef_addr addr, ef_request_id request_id);
 
-/* Commit 4: polling and timestamp capture. */
+/* Event polling and simulated timestamp capture. */
 int ef_eventq_poll(ef_vi *vi, ef_event *events, int events_len);
 int ef_vi_receive_get_timestamp(ef_vi *vi, const void *pkt,
                                 ef_timespec *out);
