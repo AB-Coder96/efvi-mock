@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 3.16)
 project(efvi_mock VERSION 0.2.0 LANGUAGES C)
 
 include(CTest)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 option(EFVI_MOCK_SHARED "Build shared library instead of static" OFF)
+option(EFVI_MOCK_BUILD_EXAMPLES "Build example applications" ON)
 option(EFVI_MOCK_SANITIZERS "Enable AddressSanitizer/UBSan with GCC/Clang" OFF)
 
 if(EFVI_MOCK_SHARED)
@@ -21,7 +24,7 @@ add_library(efvi::mock ALIAS efvi_mock)
 target_compile_features(efvi_mock PUBLIC c_std_11)
 target_include_directories(efvi_mock PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 find_package(Threads REQUIRED)
 target_link_libraries(efvi_mock PUBLIC Threads::Threads)
 set_target_properties(efvi_mock PROPERTIES
@@ -29,6 +32,9 @@ set_target_properties(efvi_mock PROPERTIES
   C_STANDARD_REQUIRED YES
   C_EXTENSIONS NO
   OUTPUT_NAME efvi_mock
+  EXPORT_NAME mock
+  VERSION ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR}
   POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -39,8 +45,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   endif()
 endif()
 
-add_executable(efvi_udp_monitor examples/udp_monitor.c)
-target_link_libraries(efvi_udp_monitor PRIVATE efvi_mock)
+if(EFVI_MOCK_BUILD_EXAMPLES)
+  add_executable(efvi_udp_monitor examples/udp_monitor.c)
+  target_link_libraries(efvi_udp_monitor PRIVATE efvi::mock)
+endif()
 
 if(BUILD_TESTING)
   add_executable(header_smoke tests/header_smoke.c)
@@ -61,11 +69,29 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-include(GNUInstallDirs)
+# Allow consumers to use find_package(efvi_mock CONFIG REQUIRED).
+set(EFVI_MOCK_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/efvi_mock")
+
+configure_package_config_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/efvi_mockConfig.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/efvi_mockConfig.cmake"
+  INSTALL_DESTINATION "${EFVI_MOCK_INSTALL_CMAKEDIR}")
+
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/efvi_mockConfigVersion.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY SameMinorVersion)
+
 install(TARGETS efvi_mock EXPORT efvi_mock_targets
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 install(FILES include/etherfabric/vi.h
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/etherfabric)
-install(EXPORT efvi_mock_targets NAMESPACE efvi::
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/efvi_mock)
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/etherfabric")
+install(EXPORT efvi_mock_targets
+  FILE efvi_mockTargets.cmake
+  NAMESPACE efvi::
+  DESTINATION "${EFVI_MOCK_INSTALL_CMAKEDIR}")
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/efvi_mockConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/efvi_mockConfigVersion.cmake"
+  DESTINATION "${EFVI_MOCK_INSTALL_CMAKEDIR}")

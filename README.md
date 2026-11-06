@@ -1,143 +1,159 @@
 # efvi-mock
 
-**Run `ef_vi` receive applications on standard Linux networking.**
+**Run applications built around Solarflare's `ef_vi` receive API on standard Linux systems.**
 
-`efvi-mock` provides a software implementation of the Solarflare/AMD `ef_vi`
-receive programming model. Applications use the familiar driver, protection
- domain, registered memory, descriptor, and event-queue interfaces while the
-Linux backend receives Ethernet frames using nonblocking `AF_PACKET` sockets.
+`efvi-mock` is an open-source software implementation of the core `ef_vi` receive programming model. It provides familiar driver, protection-domain, memory-registration, receive-descriptor, and event-queue interfaces, backed by Linux raw packet sockets.
 
-It supports IPv4 UDP unicast and multicast traffic, preserves Ethernet frame
-contents, and exposes received packets through `ef_eventq_poll()`.
+Use it as a C or C++ library in applications that need Ethernet-level packet reception without a Solarflare network adapter.
 
 ## Features
 
-- **Ethernet-level reception** — `AF_PACKET` / `SOCK_RAW` receives actual
-  Ethernet frames, including Ethernet, IPv4, and UDP headers.
-- **VLAN-aware receive buffers** — preserves 802.1Q, 802.1ad, and stacked
-  VLAN headers, including VLAN ID and priority. When the kernel supplies a
-  stripped VLAN header through `PACKET_AUXDATA`, the emulator restores it in
-  the receive buffer before delivering the completion event.
-- **UDP unicast and multicast** — local IP/port filters and multicast MAC
-  membership using the standard `ef_filter_spec` APIs.
-- **Application-managed RX descriptors** — memory registration, DMA-style
-  addresses, request IDs, receive buffer posting, and ring accounting.
-- **Nonblocking event polling** — RX, truncated-frame, and no-descriptor
-  events through `ef_eventq_poll()`.
-- **Software receive timestamps** — nanosecond-resolution realtime clock
-  readings exposed through the receive timestamp interfaces.
-- **C and C++ development** — public interface available as
-  `<etherfabric/vi.h>` and a CMake target named `efvi::mock`.
+- **Raw Ethernet reception:** `AF_PACKET` / `SOCK_RAW` delivers Ethernet frames into application-posted receive buffers.
+- **UDP unicast and multicast:** IPv4 UDP destination filtering and multicast reception through the `ef_vi`-style filter API.
+- **VLAN-aware frames:** 802.1Q, 802.1ad, and stacked VLAN headers are represented in received frame bytes, with `PACKET_AUXDATA` handling for stripped outer tags.
+- **Receive rings:** Registered buffers, DMA-style address tokens, receive request IDs, posting, and ring accounting.
+- **Event polling:** Nonblocking packet completions through `ef_eventq_poll()` and `ef_event` structures.
+- **Software receive timestamps:** Nanosecond-resolution timestamps through the supported receive timestamp interfaces.
+- **C and C++ integration:** Include `<etherfabric/vi.h>` and link the `efvi::mock` CMake target.
 
-## Build
+## Requirements
 
-Requires Linux, CMake 3.16+, and a C11 compiler.
+- Linux with `AF_PACKET` support
+- CMake 3.16 or newer
+- C11-compatible compiler (C++ applications are supported)
+- `CAP_NET_RAW` permission for applications opening raw packet sockets
+
+## Install
+
+Clone and install the library into a user-local prefix:
+
+```bash
+git clone https://github.com/<your-username>/efvi-mock.git
+cd efvi-mock
+
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+  -DBUILD_TESTING=OFF \
+  -DEFVI_MOCK_BUILD_EXAMPLES=OFF
+
+cmake --build build --parallel
+cmake --install build
+```
+
+This installs the public `etherfabric/vi.h` header, the `efvi_mock` library, and the CMake package configuration.
+
+To build a shared library instead of a static library, set `-DEFVI_MOCK_SHARED=ON` when configuring.
+
+## Use in your application
+
+Include the public API header in your C or C++ source:
+
+```cpp
+#include <etherfabric/vi.h>
+
+int main() {
+    ef_driver_handle driver;
+    if (ef_driver_open(&driver) != 0)
+        return 1;
+
+    // Allocate a protection domain, register buffers,
+    // post receive descriptors, and poll ef_eventq_poll().
+
+    return ef_driver_close(driver) == 0 ? 0 : 1;
+}
+```
+
+In your application's `CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_receiver LANGUAGES CXX)
+
+find_package(efvi_mock CONFIG REQUIRED)
+
+add_executable(my_receiver main.cpp)
+target_link_libraries(my_receiver PRIVATE efvi::mock)
+```
+
+Configure and build your application using the installation prefix:
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH="$HOME/.local"
+cmake --build build --parallel
+```
+
+Once the package is installed in a standard system prefix, `CMAKE_PREFIX_PATH` generally is not needed.
+
+### Run your application
+
+Linux raw packet sockets require `CAP_NET_RAW`. For a local development executable:
+
+```bash
+sudo ./build/my_receiver
+```
+
+Alternatively, grant the capability to the executable:
+
+```bash
+sudo setcap cap_net_raw+ep ./build/my_receiver
+./build/my_receiver
+```
+
+## Receive model
+
+The application allocates an `ef_vi` context, registers receive memory, posts descriptors, and polls for completions. Each completed receive buffer contains a raw Ethernet frame and is identified by its receive request ID.
+
+```text
+Ethernet interface
+       |
+       v
+Linux AF_PACKET / SOCK_RAW
+       |
+       v
+Registered receive buffers
+       |
+       v
+ef_eventq_poll() --> ef_event --> application
+```
+
+Typical API sequence:
+
+1. `ef_driver_open()` and `ef_pd_alloc()` to initialize the driver and protection domain.
+2. `ef_memreg_alloc()` to register the application's receive memory.
+3. `ef_vi_alloc_from_pd()` to create the virtual interface.
+4. `ef_filter_spec_set_ip4_local()` and `ef_vi_filter_add()` to select IPv4 UDP traffic.
+5. `ef_vi_receive_init()` and `ef_vi_receive_push()` to post receive buffers.
+6. `ef_eventq_poll()` to process completions; then repost consumed buffers with `ef_vi_receive_post()`.
+7. Release resources in reverse order.
+
+### Ethernet and VLAN frames
+
+The returned buffer begins with the Ethernet header. VLAN tags, when present, are part of the frame bytes rather than separate event fields:
+
+```text
+Untagged: [Dst MAC][Src MAC][EtherType][Payload]
+802.1Q:   [Dst MAC][Src MAC][0x8100][TCI][EtherType][Payload]
+802.1ad:  [Dst MAC][Src MAC][0x88A8][Outer TCI][0x8100][Inner TCI][EtherType][Payload]
+```
+
+The VLAN tag control information (TCI) contains priority (PCP), drop eligibility (DEI), and VLAN ID. The receive event provides the request ID and received frame length through `EF_EVENT_RX_RQ_ID(event)` and `EF_EVENT_RX_BYTES(event)`.
+
+## Example receiver
+
+Build the included receiver example:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-```
-
-Raw Ethernet sockets require `CAP_NET_RAW`. Run the example with `sudo`, or
-assign the capability to the executable:
-
-```bash
-sudo setcap cap_net_raw+ep ./build/efvi_udp_monitor
-```
-
-## Run the receiver
-
-Receive IPv4 UDP traffic addressed to `127.0.0.1:9000` on loopback:
-
-```bash
-sudo ./build/efvi_udp_monitor 127.0.0.1 9000 lo
-```
-
-Send a packet from another terminal:
-
-```bash
-python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"hello", ("127.0.0.1", 9000))'
-```
-
-To receive a UDP multicast group on an Ethernet interface:
-
-```bash
 sudo ./build/efvi_udp_monitor 239.42.0.1 9000 eth0
 ```
 
-The optional interface argument selects the protection-domain interface;
-without it, the socket observes all interfaces. For multicast, the emulator
-adds packet-socket multicast MAC membership on the selected interface, or
-on available interfaces when no interface is selected. Network infrastructure
-using IGMP snooping may additionally require an active IGMP membership to
-forward traffic to the host.
+The final argument selects the interface. The receiver prints packet details and VLAN information when present.
 
-## Ethernet and VLAN layout
+## Supported API
 
-Each `EF_EVENT_TYPE_RX` completion identifies a posted receive buffer.
-The bytes in that buffer begin with the received Ethernet header:
-
-```text
-Untagged Ethernet:
-  [destination MAC:6][source MAC:6][EtherType:2][L3 packet ...]
-
-802.1Q:
-  [destination MAC:6][source MAC:6][TPID=0x8100:2]
-  [TCI:2][inner EtherType:2][L3 packet ...]
-
-802.1ad / QinQ:
-  [destination MAC:6][source MAC:6][TPID=0x88a8:2]
-  [outer TCI:2][TPID=0x8100:2][inner TCI:2]
-  [inner EtherType:2][L3 packet ...]
-```
-
-The 16-bit tag control information (TCI) includes PCP (bits 15–13), DEI
-(bit 12), and VLAN ID (bits 11–0). The sample receiver prints the VLAN ID,
-priority, and tag count when a VLAN-tagged frame is received.
-
-The application obtains the frame length from `EF_EVENT_RX_BYTES(event)`
-and the matching buffer from `EF_EVENT_RX_RQ_ID(event)`. `ef_vi` does not
-require an additional VLAN field in the completion event: VLAN tags are
-part of the Ethernet frame bytes.
-
-If the Linux NIC driver has already removed the outer VLAN tag, the emulator
-uses `PACKET_AUXDATA` metadata to insert the tag back into the frame before
-reporting the RX event. This is included in the reported frame length and
-must fit in the posted receive buffer.
-
-## Integration
-
-Include the public header:
-
-```c
-#include <etherfabric/vi.h>
-```
-
-Link using CMake:
-
-```cmake
-add_subdirectory(path/to/efvi-mock)
-target_link_libraries(your_application PRIVATE efvi::mock)
-```
-
-A typical receive flow is:
-
-1. `ef_driver_open()` → `ef_pd_alloc()`.
-2. Register page-aligned buffer memory with `ef_memreg_alloc()`.
-3. Create the virtual interface with `ef_vi_alloc_from_pd()`.
-4. Configure an IPv4 UDP destination filter using
-   `ef_filter_spec_set_ip4_local()` and `ef_vi_filter_add()`.
-5. Post RX buffers using `ef_vi_receive_init()` and `ef_vi_receive_push()`.
-6. Poll `ef_eventq_poll()`, inspect each Ethernet frame, and repost the
-   completed buffer with `ef_vi_receive_post()`.
-7. Free resources in reverse order.
-
-The example in [`examples/udp_monitor.c`](examples/udp_monitor.c) demonstrates
-the complete receive loop.
-
-### Supported API
-
-| Category | Interfaces |
+| Area | Functions and interfaces |
 | --- | --- |
 | Driver | `ef_driver_open`, `ef_driver_close` |
 | Protection domain | `ef_pd_alloc`, `ef_pd_free` |
@@ -145,37 +161,12 @@ the complete receive loop.
 | Virtual interface | `ef_vi_alloc_from_pd`, `ef_vi_free` |
 | Filtering | `ef_filter_spec_init`, `ef_filter_spec_set_ip4_local`, `ef_vi_filter_add` |
 | Receive descriptors | `ef_vi_receive_init`, `ef_vi_receive_push`, `ef_vi_receive_post` |
-| Receive ring | `ef_vi_receive_capacity`, `ef_vi_receive_fill_level`, `ef_vi_receive_space` |
-| Event queue | `ef_eventq_poll`, `EF_EVENT_TYPE_RX`, `EF_EVENT_TYPE_RX_DISCARD` |
+| Ring state | `ef_vi_receive_capacity`, `ef_vi_receive_fill_level`, `ef_vi_receive_space` |
+| Events | `ef_eventq_poll`, `EF_EVENT_TYPE_RX`, `EF_EVENT_TYPE_RX_DISCARD` |
 | Timestamps | `ef_vi_receive_get_timestamp`, `ef_vi_receive_get_timestamp_with_sync_flags`, `ef_vi_receive_get_precise_timestamp` |
-
-## Replaying Ethernet frames
-
-The emulator accepts any IPv4 UDP payload format, including binary data. For
-Ethernet-accurate replay, including VLAN tags, replay a pcap onto an interface
-connected to the receiving interface (for example, a veth pair or separate
-host):
-
-```bash
-sudo tcpreplay --intf1=<transmit-interface> capture.pcap
-```
-
-A UDP-payload replay helper is also included in `tools/pcap_to_udp.py` for
-testing application-level traffic over the ordinary Linux UDP stack.
-
-## Development and tests
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-The suite includes header checks, VLAN packet parsing and restoration tests,
-a raw-socket integration test, and a PCAP parser test. The live receive
-integration test runs when `CAP_NET_RAW` is available.
 
 ## License
 
 BSD-2-Clause. See [LICENSE](LICENSE).
 
-`efvi-mock` is an independent software implementation and is not affiliated
-with or endorsed by AMD or Solarflare.
+`efvi-mock` is an independent implementation and is not affiliated with or endorsed by AMD or Solarflare.
