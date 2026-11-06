@@ -28,7 +28,7 @@ Use it as a C or C++ library in applications that need Ethernet-level packet rec
 Clone and install the library into a user-local prefix:
 
 ```bash
-git clone https://github.com/<your-username>/efvi-mock.git
+
 cd efvi-mock
 
 cmake -S . -B build \
