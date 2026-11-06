@@ -1,65 +1,61 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #define _GNU_SOURCE
 #include "mock_internal.h"
-#include <arpa/inet.h>
+#include "mock_packet.h"
 #include <errno.h>
+#include <linux/if_packet.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <sys/socket.h>
 
-static void net16(uint8_t *p, uint16_t n)
-{
-  p[0] = (uint8_t)(n >> 8);
-  p[1] = (uint8_t)n;
-}
+struct packet_rx_metadata {
+  bool has_vlan;
+  uint16_t tpid;
+  uint16_t tci;
+};
 
-static uint16_t ip_checksum(const uint8_t *p, size_t n)
+/* One nonblocking packet-socket receive.  MSG_TRUNC reports the wire
+ * length when the supplied buffer is shorter than the frame. */
+static ssize_t receive_frame(int fd, uint8_t *dst, size_t cap,
+                             struct packet_rx_metadata *meta)
 {
-  uint32_t sum = 0;
-  for (size_t i = 0; i < n; i += 2)
-    sum += (uint32_t)((uint16_t)p[i] << 8 | p[i + 1]);
-  while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
-  return (uint16_t)~sum;
-}
+  struct iovec iov = { .iov_base = dst, .iov_len = cap };
+  struct sockaddr_ll sender = {0};
+  char ancillary[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
+  struct msghdr msg = {0};
+  msg.msg_name = &sender;
+  msg.msg_namelen = sizeof(sender);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = ancillary;
+  msg.msg_controllen = sizeof(ancillary);
+  ssize_t n;
+  do {
+    n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
+  } while (n < 0 && errno == EINTR);
+  if (n < 0) return -errno;
 
-static void make_frame_headers(struct ef_mock_vi_context *ctx,
-                               uint8_t *buf, size_t payload_bytes,
-                               const struct sockaddr_in *remote,
-                               uint32_t dest_ip_be)
-{
-  memset(buf, 0, EFVI_MOCK_ETH_IPV4_UDP_HEADER_BYTES);
-  if (IN_MULTICAST(ntohl(dest_ip_be))) {
-    uint32_t multicast_ip = ntohl(dest_ip_be);
-    buf[0] = 0x01; buf[1] = 0x00; buf[2] = 0x5e;
-    buf[3] = (uint8_t)((multicast_ip >> 16) & 0x7fu);
-    buf[4] = (uint8_t)(multicast_ip >> 8);
-    buf[5] = (uint8_t)multicast_ip;
+  meta->has_vlan = false;
+  meta->tpid = 0x8100u;
+  meta->tci = 0;
+  for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg;
+       cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+    if (cmsg->cmsg_level != SOL_PACKET || cmsg->cmsg_type != PACKET_AUXDATA ||
+        cmsg->cmsg_len < CMSG_LEN(sizeof(struct tpacket_auxdata)))
+      continue;
+    const struct tpacket_auxdata *aux = (const void *)CMSG_DATA(cmsg);
+    if (!(aux->tp_status & TP_STATUS_VLAN_VALID)) continue;
+    meta->has_vlan = true;
+    meta->tci = aux->tp_vlan_tci;
+#ifdef TP_STATUS_VLAN_TPID_VALID
+    if (aux->tp_status & TP_STATUS_VLAN_TPID_VALID)
+      meta->tpid = aux->tp_vlan_tpid;
+#endif
   }
-  else {
-    buf[0] = 0x02; buf[5] = 0x01;
-  }
-  buf[6] = 0x02; buf[11] = 0x02; /* Deterministic synthetic source MAC. */
-  buf[12] = 0x08; buf[13] = 0x00; /* Ethernet IPv4 ethertype. */
-
-  uint8_t *ip = buf + 14;
-  ip[0] = 0x45;           /* IPv4 without options. */
-  net16(ip + 2, (uint16_t)(20u + 8u + payload_bytes));
-  net16(ip + 4, ctx->next_ip_id++);
-  net16(ip + 6, 0x4000); /* Synthetic unfragmented datagram. */
-  ip[8] = 64;
-  ip[9] = IPPROTO_UDP;
-  memcpy(ip + 12, &remote->sin_addr.s_addr, 4);
-  memcpy(ip + 16, &dest_ip_be, 4);
-  net16(ip + 10, ip_checksum(ip, 20));
-
-  uint8_t *udp = buf + 34;
-  memcpy(udp, &remote->sin_port, 2);
-  memcpy(udp + 2, &ctx->filter_port_be, 2);
-  net16(udp + 4, (uint16_t)(8u + payload_bytes));
-  /* An IPv4 UDP checksum of zero is legal; it is not a hardware checksum. */
+  return n;
 }
 
-static void discard_event(ef_event *event, struct ef_mock_rx_descriptor *d,
+static void discard_event(ef_event *event, const struct ef_mock_rx_descriptor *d,
                           size_t frame_bytes)
 {
   memset(event, 0, sizeof(*event));
@@ -69,20 +65,41 @@ static void discard_event(ef_event *event, struct ef_mock_rx_descriptor *d,
   event->rx_discard.subtype = EF_EVENT_RX_DISCARD_TRUNC;
 }
 
-/* Drain at most one datagram when no pushed descriptor exists. */
-static int discard_without_descriptor(struct ef_mock_vi_context *ctx,
+static struct ef_mock_ipv4_udp_filter active_filter(
+    const struct ef_mock_vi_context *ctx)
+{
+  struct ef_mock_ipv4_udp_filter filter;
+  filter.address_be = ctx->filter_addr_be;
+  filter.port_be = ctx->filter_port_be;
+  return filter;
+}
+
+/* Called only when there are no pushed descriptors.  Filtering must still
+ * run, otherwise unrelated traffic produces spurious no-descriptor events. */
+static int receive_without_descriptor(struct ef_mock_vi_context *ctx,
                                       ef_event *event)
 {
-  char scratch;
-  ssize_t n;
-  do {
-    n = recv(ctx->socket_fd, &scratch, sizeof(scratch), MSG_DONTWAIT | MSG_TRUNC);
-  } while (n < 0 && errno == EINTR);
-  if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -errno;
-  memset(event, 0, sizeof(*event));
-  event->rx_no_desc_trunc.type = EF_EVENT_TYPE_RX_NO_DESC_TRUNC;
-  ++ctx->packets_dropped;
-  return 1;
+  uint8_t scratch[256];
+  const struct ef_mock_ipv4_udp_filter filter = active_filter(ctx);
+  for (unsigned inspected = 0; inspected < 128u; ++inspected) {
+    struct packet_rx_metadata meta;
+    ssize_t n = receive_frame(ctx->socket_fd, scratch, sizeof(scratch), &meta);
+    if (n < 0) return n == -EAGAIN || n == -EWOULDBLOCK ? 0 : (int)n;
+    size_t copied = (size_t)n < sizeof(scratch) ? (size_t)n : sizeof(scratch);
+    if (meta.has_vlan && copied >= EFVI_MOCK_ETH_HEADER_BYTES &&
+        copied + EFVI_MOCK_VLAN_HEADER_BYTES <= sizeof(scratch)) {
+      int rc = ef_mock_packet_restore_vlan(scratch, &copied, sizeof(scratch),
+                                           meta.tpid, meta.tci);
+      if (rc < 0) continue;
+    }
+    if (!ef_mock_packet_matches_ip4_udp(scratch, copied, &filter, NULL))
+      continue;
+    memset(event, 0, sizeof(*event));
+    event->rx_no_desc_trunc.type = EF_EVENT_TYPE_RX_NO_DESC_TRUNC;
+    ++ctx->packets_dropped;
+    return 1;
+  }
+  return 0;
 }
 
 int ef_eventq_poll(ef_vi *vi, ef_event *events, int events_len)
@@ -92,74 +109,61 @@ int ef_eventq_poll(ef_vi *vi, ef_event *events, int events_len)
   struct ef_mock_vi_context *ctx = vi->mock_private;
   if (!ctx->filtered) return 0;
   ++ctx->poll_generation;
+  const struct ef_mock_ipv4_udp_filter filter = active_filter(ctx);
   int completed = 0;
-  while (completed < events_len) {
+  size_t inspected = 0;
+  size_t budget = (size_t)events_len * 64u + 64u;
+  while (completed < events_len && inspected < budget) {
     if (vi->ep_state->rxq.removed == vi->ep_state->rxq.posted) {
-      int rc = discard_without_descriptor(ctx, &events[completed]);
+      int rc = receive_without_descriptor(ctx, &events[completed]);
       if (rc <= 0) return completed ? completed : rc;
       ++completed;
       continue;
     }
     uint32_t slot = vi->ep_state->rxq.removed & vi->vi_rxq.mask;
     struct ef_mock_rx_descriptor *d = &ctx->descriptors[slot];
-    struct sockaddr_in remote;
-    struct iovec iov;
-    struct msghdr msg;
-    char ancillary[CMSG_SPACE(sizeof(struct in_pktinfo))];
-    memset(&remote, 0, sizeof(remote));
-    memset(&msg, 0, sizeof(msg));
-    iov.iov_base = d->packet + EFVI_MOCK_ETH_IPV4_UDP_HEADER_BYTES;
-    iov.iov_len = d->buffer_bytes - EFVI_MOCK_ETH_IPV4_UDP_HEADER_BYTES;
-    msg.msg_name = &remote;
-    msg.msg_namelen = sizeof(remote);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = ancillary;
-    msg.msg_controllen = sizeof(ancillary);
-    ssize_t read_bytes;
-    do {
-      read_bytes = recvmsg(ctx->socket_fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
-    } while (read_bytes < 0 && errno == EINTR);
-    if (read_bytes < 0) {
-      int saved = errno;
-      if (saved == EAGAIN || saved == EWOULDBLOCK) break;
-      return completed ? completed : -saved;
+    struct packet_rx_metadata meta;
+    ssize_t n = receive_frame(ctx->socket_fd, d->packet, d->buffer_bytes, &meta);
+    if (n < 0) {
+      if (n == -EAGAIN || n == -EWOULDBLOCK) break;
+      return completed ? completed : (int)n;
     }
-    uint32_t dest_ip_be = ctx->filter_addr_be;
-    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg;
-         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-      if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
-          cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
-        const struct in_pktinfo *info = (const void *)CMSG_DATA(cmsg);
-        dest_ip_be = info->ipi_addr.s_addr;
+    ++inspected;
+    size_t copied = (size_t)n < d->buffer_bytes ? (size_t)n : d->buffer_bytes;
+    size_t frame_bytes = (size_t)n;
+    bool truncated = (size_t)n > d->buffer_bytes;
+
+    /* PACKET_AUXDATA reports VLAN tags that the driver stripped from the
+     * skb.  Restore the 4-byte outer header in the application buffer so
+     * that parsing the packet matches on-wire 802.1Q/802.1ad layout. */
+    if (meta.has_vlan) {
+      frame_bytes += EFVI_MOCK_VLAN_HEADER_BYTES;
+      if (!truncated) {
+        int rc = ef_mock_packet_restore_vlan(d->packet, &copied,
+                                             d->buffer_bytes, meta.tpid,
+                                             meta.tci);
+        if (rc < 0) truncated = true;
       }
     }
-    /* A multicast socket bound to INADDR_ANY must still reject other groups. */
-    if (ctx->filter_addr_be != htonl(INADDR_ANY) &&
-        dest_ip_be != ctx->filter_addr_be) {
-      ++ctx->packets_dropped;
-      /* Filtered in software: do not consume an RX descriptor. */
+    if (!ef_mock_packet_matches_ip4_udp(d->packet, copied, &filter, NULL)) {
+      /* Packet is not for this VI: leave descriptor queued. */
       continue;
     }
-    size_t length = EFVI_MOCK_ETH_IPV4_UDP_HEADER_BYTES +
-                    (size_t)read_bytes;
-    bool truncated = (msg.msg_flags & MSG_TRUNC) ||
-                     (size_t)read_bytes > iov.iov_len ||
-                     length > EFVI_MOCK_MAX_FRAME_BYTES;
-    if (truncated) {
-      discard_event(&events[completed], d, length);
+    if (truncated || frame_bytes > EFVI_MOCK_MAX_FRAME_BYTES) {
+      discard_event(&events[completed], d, frame_bytes);
       d->timestamp_valid = false;
       ++ctx->packets_dropped;
     }
     else {
-      make_frame_headers(ctx, d->packet, (size_t)read_bytes,
-                         &remote, dest_ip_be);
+      bool multicast = false;
+      (void)ef_mock_packet_matches_ip4_udp(d->packet, copied,
+                                            &filter, &multicast);
       memset(&events[completed], 0, sizeof(events[completed]));
       events[completed].rx.type = EF_EVENT_TYPE_RX;
       events[completed].rx.rq_id = (uint32_t)d->request_id;
-      events[completed].rx.len = (uint16_t)length;
+      events[completed].rx.len = (uint16_t)frame_bytes;
       events[completed].rx.flags = EF_EVENT_FLAG_SOP |
-          (IN_MULTICAST(ntohl(dest_ip_be)) ? EF_EVENT_FLAG_MULTICAST : 0);
+          (multicast ? EF_EVENT_FLAG_MULTICAST : 0);
       if (vi->vi_flags & EF_VI_RX_TIMESTAMPS) {
         if (clock_gettime(CLOCK_REALTIME, &d->utc) == 0 &&
             clock_gettime(CLOCK_MONOTONIC, &d->monotonic) == 0) {
@@ -210,7 +214,7 @@ int ef_vi_receive_get_timestamp_with_sync_flags(ef_vi *vi, const void *pkt,
 {
   if (!flags_out) return -EINVAL;
   int rc = lookup_timestamp(vi, pkt, out);
-  if (!rc) *flags_out = 0; /* Software clock: no asserted PTP sync state. */
+  if (!rc) *flags_out = 0;
   return rc;
 }
 

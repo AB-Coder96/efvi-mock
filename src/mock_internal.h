@@ -13,7 +13,7 @@
 #define EFVI_MOCK_DEFAULT_RX_CAPACITY 512u
 #define EFVI_MOCK_DEFAULT_BUFFER_BYTES 2048u
 #define EFVI_MOCK_MAX_RX_CAPACITY 65536u
-#define EFVI_MOCK_ETH_IPV4_UDP_HEADER_BYTES 42u
+#define EFVI_MOCK_MIN_ETH_FRAME_BYTES 14u
 #define EFVI_MOCK_FILTER_IP4_LOCAL 1u
 #define EFVI_MOCK_MAX_FRAME_BYTES UINT16_MAX
 
@@ -56,7 +56,6 @@ struct ef_mock_vi_context {
   ef_pd *pd;
   ef_driver_handle driver;
   uint32_t rx_capacity;
-  uint16_t next_ip_id;
   bool filtered;
   uint32_t filter_addr_be;
   uint16_t filter_port_be;

@@ -3,7 +3,9 @@
 #include "mock_internal.h"
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,22 +45,34 @@ int ef_vi_alloc_from_pd(ef_vi *vi, ef_driver_handle vi_dh,
     goto fail;
   }
   ctx->socket_fd = -1;
-  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  ctx->ifindex = ((const struct ef_mock_pd_state *)pd->mock_private)->ifindex;
+  int fd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                  htons(ETH_P_ALL));
   if (fd < 0) { rc = -errno; goto fail; }
   ctx->socket_fd = fd;
+
   int enable = 1;
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) ||
-      setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &enable, sizeof(enable))) {
+  if (setsockopt(fd, SOL_PACKET, PACKET_AUXDATA, &enable, sizeof(enable)) < 0) {
     rc = -errno;
     goto fail;
   }
-#ifdef IP_MULTICAST_ALL
-  int disable = 0;
-  (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &disable, sizeof(disable));
+#ifdef PACKET_IGNORE_OUTGOING
+  /* A VI receives ingress traffic.  An AF_PACKET tap otherwise also
+   * observes traffic being transmitted by this host. */
+  (void)setsockopt(fd, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+                   &enable, sizeof(enable));
 #endif
+  struct sockaddr_ll bind_addr = {0};
+  bind_addr.sll_family = AF_PACKET;
+  bind_addr.sll_protocol = htons(ETH_P_ALL);
+  bind_addr.sll_ifindex = (int)ctx->ifindex; /* 0 means all interfaces. */
+  if (bind(fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+    rc = -errno;
+    goto fail;
+  }
+
   ctx->pd = pd;
   ctx->driver = vi_dh;
-  ctx->ifindex = ((const struct ef_mock_pd_state *)pd->mock_private)->ifindex;
   ctx->rx_capacity = cap;
   ctx->descriptors = descs;
   vi->vi_rxq.mask = cap - 1;
@@ -116,11 +130,48 @@ int ef_filter_spec_set_ip4_local(ef_filter_spec *spec, int protocol,
   if (spec->flags != EF_FILTER_FLAG_NONE) return -EOPNOTSUPP;
   spec->type = EFVI_MOCK_FILTER_IP4_LOCAL;
   spec->data[0] = (unsigned)protocol;
-  spec->data[1] = host_be32; /* Network order, like sockaddr_in.sin_addr.s_addr. */
-  spec->data[2] = (unsigned)port_be16; /* Network order, like sin_port. */
+  spec->data[1] = host_be32;
+  spec->data[2] = (unsigned)port_be16;
   return 0;
 }
 
+/* Subscribe to the Ethernet multicast MAC corresponding to an IPv4 group.
+ * A wildcard PD subscribes on available interfaces; a concrete PD affects
+ * only its selected interface.  Socket closure releases memberships. */
+static int join_ipv4_multicast(int fd, unsigned ifindex, uint32_t ip_be)
+{
+  uint32_t ip = ntohl(ip_be);
+  struct packet_mreq mreq = {0};
+  mreq.mr_type = PACKET_MR_MULTICAST;
+  mreq.mr_alen = ETH_ALEN;
+  mreq.mr_address[0] = 0x01;
+  mreq.mr_address[1] = 0x00;
+  mreq.mr_address[2] = 0x5e;
+  mreq.mr_address[3] = (uint8_t)((ip >> 16) & 0x7fu);
+  mreq.mr_address[4] = (uint8_t)(ip >> 8);
+  mreq.mr_address[5] = (uint8_t)ip;
+  if (ifindex != 0) {
+    mreq.mr_ifindex = (int)ifindex;
+    if (setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+                   &mreq, sizeof(mreq)) < 0) return -errno;
+    return 0;
+  }
+  struct if_nameindex *interfaces = if_nameindex();
+  if (!interfaces) return -errno;
+  unsigned joined = 0;
+  int last_error = -ENODEV;
+  for (const struct if_nameindex *it = interfaces; it->if_index; ++it) {
+    mreq.mr_ifindex = (int)it->if_index;
+    if (setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+                   &mreq, sizeof(mreq)) == 0) ++joined;
+    else last_error = -errno;
+  }
+  if_freenameindex(interfaces);
+  return joined ? 0 : last_error;
+}
+
+/* AF_PACKET provides the wire Ethernet frame to the application.  The
+ * filter controls delivery to the VI, not whether the kernel can tap it. */
 int ef_vi_filter_add(ef_vi *vi, ef_driver_handle dh,
                      const ef_filter_spec *spec, ef_filter_cookie *cookie)
 {
@@ -134,22 +185,9 @@ int ef_vi_filter_add(ef_vi *vi, ef_driver_handle dh,
 
   uint32_t ip_be = spec->data[1];
   uint16_t port_be = (uint16_t)spec->data[2];
-  bool is_mcast = IN_MULTICAST(ntohl(ip_be));
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = port_be;
-  addr.sin_addr.s_addr = is_mcast ? htonl(INADDR_ANY) : ip_be;
-  if (bind(ctx->socket_fd, (const struct sockaddr *)&addr, sizeof(addr)) < 0)
-    return -errno;
-  if (is_mcast) {
-    struct ip_mreqn membership;
-    memset(&membership, 0, sizeof(membership));
-    membership.imr_multiaddr.s_addr = ip_be;
-    membership.imr_ifindex = (int)ctx->ifindex;
-    if (setsockopt(ctx->socket_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   &membership, sizeof(membership)) < 0)
-      return -errno;
+  if (IN_MULTICAST(ntohl(ip_be))) {
+    int rc = join_ipv4_multicast(ctx->socket_fd, ctx->ifindex, ip_be);
+    if (rc < 0) return rc;
   }
   ctx->filter_addr_be = ip_be;
   ctx->filter_port_be = port_be;
@@ -166,7 +204,7 @@ int ef_vi_receive_init(ef_vi *vi, ef_addr addr, ef_request_id request_id)
   if (!vi || !vi->mock_private || !vi->ep_state) return -EINVAL;
   struct ef_mock_vi_context *ctx = vi->mock_private;
   if (request_id < 0 || (addr & (EF_VI_DMA_ALIGN - 1u))) return -EINVAL;
-  if (vi->rx_buffer_len < EFVI_MOCK_ETH_IPV4_UDP_HEADER_BYTES ||
+  if (vi->rx_buffer_len < EFVI_MOCK_MIN_ETH_FRAME_BYTES ||
       vi->rx_buffer_len > EFVI_MOCK_MAX_FRAME_BYTES) return -EINVAL;
   if (ef_vi_receive_space(vi) <= 0) return -EAGAIN;
   struct ef_mock_memreg_state *reg;

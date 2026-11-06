@@ -3,6 +3,7 @@
 #include <etherfabric/vi.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
@@ -19,7 +20,44 @@
 static volatile sig_atomic_t stop_requested;
 static void on_signal(int signum) { (void)signum; stop_requested = 1; }
 
-static int run(const char *ip, const char *port_string)
+static unsigned read_be16(const uint8_t *p)
+{
+  return (unsigned)p[0] * 256u + p[1];
+}
+
+static void print_frame(const uint8_t *frame, unsigned bytes,
+                        unsigned id, const ef_timespec *stamp)
+{
+  if (bytes < 14) return;
+  unsigned type = read_be16(frame + 12);
+  unsigned offset = 14;
+  unsigned vlan = 0;
+  unsigned priority = 0;
+  unsigned tags = 0;
+  while ((type == 0x8100 || type == 0x88a8 || type == 0x9100) &&
+         offset + 4 <= bytes && tags < 4) {
+    unsigned tci = read_be16(frame + offset);
+    vlan = tci & 0x0fffu;
+    priority = (tci >> 13) & 7u;
+    type = read_be16(frame + offset + 2);
+    offset += 4;
+    ++tags;
+  }
+  unsigned payload_bytes = 0;
+  if (type == 0x0800 && offset + 28 <= bytes) {
+    const uint8_t *ip = frame + offset;
+    unsigned ihl = (ip[0] & 15u) * 4u;
+    if ((ip[0] >> 4) == 4 && ihl >= 20 && ip[9] == IPPROTO_UDP &&
+        offset + ihl + 8 <= bytes)
+      payload_bytes = bytes - offset - ihl - 8;
+  }
+  printf("%lld.%09ld id=%u frame_bytes=%u udp_payload_bytes=%u",
+         (long long)stamp->tv_sec, stamp->tv_nsec, id, bytes, payload_bytes);
+  if (tags) printf(" vlan_id=%u pcp=%u tags=%u", vlan, priority, tags);
+  putchar('\n');
+}
+
+static int run(const char *ip, const char *port_string, const char *interface)
 {
   char *end;
   errno = 0;
@@ -27,6 +65,11 @@ static int run(const char *ip, const char *port_string)
   if (errno || *end || port == 0 || port > UINT16_MAX) return -EINVAL;
   struct in_addr addr;
   if (inet_pton(AF_INET, ip, &addr) != 1) return -EINVAL;
+  unsigned ifindex = 0;
+  if (interface) {
+    ifindex = if_nametoindex(interface);
+    if (!ifindex) return -ENODEV;
+  }
   ef_driver_handle dh = -1;
   ef_pd pd = {0};
   ef_memreg mr = {0};
@@ -34,7 +77,7 @@ static int run(const char *ip, const char *port_string)
   void *buf = NULL;
   int rc = ef_driver_open(&dh);
   if (rc < 0) goto cleanup;
-  rc = ef_pd_alloc(&pd, dh, 0, EF_PD_DEFAULT);
+  rc = ef_pd_alloc(&pd, dh, (int)ifindex, EF_PD_DEFAULT);
   if (rc < 0) goto cleanup;
   rc = posix_memalign(&buf, EF_VI_NIC_PAGE_SIZE, RX_SLOTS * SLOT_BYTES);
   if (rc) { rc = -rc; goto cleanup; }
@@ -56,7 +99,8 @@ static int run(const char *ip, const char *port_string)
     if (rc < 0) goto cleanup;
   }
   ef_vi_receive_push(&vi);
-  printf("efvi-mock listening on %s:%lu; Ctrl-C to stop\n", ip, port);
+  printf("efvi-mock raw Ethernet RX %s:%lu interface=%s; Ctrl-C to stop\n",
+         ip, port, interface ? interface : "any");
   fflush(stdout);
   while (!stop_requested) {
     ef_event events[32];
@@ -78,14 +122,9 @@ static int run(const char *ip, const char *port_string)
         if (EF_EVENT_TYPE(*ev) == EF_EVENT_TYPE_RX) {
           ef_timespec stamp;
           if (ef_vi_receive_get_timestamp(&vi, pkt, &stamp) == 0)
-            printf("%lld.%09ld id=%u ethernet_bytes=%u udp_payload_bytes=%u\n",
-                   (long long)stamp.tv_sec, stamp.tv_nsec, id,
-                   (unsigned)EF_EVENT_RX_BYTES(*ev),
-                   (unsigned)EF_EVENT_RX_BYTES(*ev) - 42u);
+            print_frame(pkt, EF_EVENT_RX_BYTES(*ev), id, &stamp);
         }
-        else {
-          fprintf(stderr, "RX truncated id=%u\n", id);
-        }
+        else fprintf(stderr, "RX truncated id=%u\n", id);
         rc = ef_vi_receive_post(&vi, ef_memreg_dma_addr(&mr, id * SLOT_BYTES),
                                  (ef_request_id)id);
         if (rc < 0) goto cleanup;
@@ -107,13 +146,14 @@ cleanup:
 
 int main(int argc, char **argv)
 {
-  if (argc != 3) {
-    fprintf(stderr, "usage: %s <local-ip-or-multicast-group> <port>\n", argv[0]);
+  if (argc != 3 && argc != 4) {
+    fprintf(stderr, "usage: %s <local-ip-or-multicast-group> <port> [interface]\n",
+            argv[0]);
     return 2;
   }
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
-  int rc = run(argv[1], argv[2]);
+  int rc = run(argv[1], argv[2], argc == 4 ? argv[3] : NULL);
   if (rc < 0) {
     fprintf(stderr, "efvi-mock: %s\n", strerror(-rc));
     return 1;

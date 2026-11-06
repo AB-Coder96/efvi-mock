@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """Replay Ethernet/IPv4/UDP payloads from a classic PCAP through Linux UDP.
 
-Useful for testing efvi-mock on a machine without an RX-capable NIC. The
-receiver synthesizes the Ethernet/IP/UDP headers; only the payload is replayed.
+This helper sends UDP payloads through the normal Linux networking stack.
+For faithful Ethernet/VLAN replay, use tcpreplay and an AF_PACKET receiver.
 """
 import argparse
 import socket

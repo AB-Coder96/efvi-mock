@@ -15,6 +15,7 @@ add_library(efvi_mock ${EFVI_MOCK_LIBRARY_TYPE}
   src/mock_driver.c
   src/mock_vi.c
   src/mock_eventq.c
+  src/mock_packet.c
 )
 add_library(efvi::mock ALIAS efvi_mock)
 target_compile_features(efvi_mock PUBLIC c_std_11)
@@ -48,7 +49,11 @@ if(BUILD_TESTING)
   add_executable(udp_integration tests/udp_integration.c)
   target_link_libraries(udp_integration PRIVATE efvi_mock)
   add_test(NAME udp_integration COMMAND udp_integration)
+  set_tests_properties(udp_integration PROPERTIES SKIP_RETURN_CODE 77)
   set_tests_properties(udp_integration PROPERTIES TIMEOUT 15)
+  add_executable(packet_unit tests/packet_unit.c src/mock_packet.c)
+  target_include_directories(packet_unit PRIVATE src)
+  add_test(NAME packet_unit COMMAND packet_unit)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(NAME pcap_replay_parser

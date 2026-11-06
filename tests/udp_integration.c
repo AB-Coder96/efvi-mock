@@ -59,8 +59,18 @@ int main(void)
                          TEST_BUFFERS * BUFFER_BYTES) == 0);
   assert(ef_pd_free(&pd, dh) == -EBUSY);
   assert(ef_memreg_dma_addr(&mr, 4096) != ef_memreg_dma_addr(&mr, 0));
-  assert(ef_vi_alloc_from_pd(&vi, dh, &pd, dh, -1, TEST_BUFFERS,
-                             0, NULL, -1, EF_VI_RX_TIMESTAMPS) == 0);
+  int alloc_rc = ef_vi_alloc_from_pd(&vi, dh, &pd, dh, -1, TEST_BUFFERS,
+                                     0, NULL, -1, EF_VI_RX_TIMESTAMPS);
+  if (alloc_rc == -EPERM || alloc_rc == -EACCES) {
+    /* AF_PACKET/SOCK_RAW requires CAP_NET_RAW in the test environment. */
+    assert(ef_memreg_free(&mr, dh) == 0);
+    assert(ef_pd_free(&pd, dh) == 0);
+    assert(ef_driver_close(dh) == 0);
+    free(mem);
+    puts("raw_integration: SKIP (CAP_NET_RAW required)");
+    return 77;
+  }
+  assert(alloc_rc == 0);
   assert(ef_vi_receive_capacity(&vi) == TEST_BUFFERS);
   assert(ef_vi_receive_space(&vi) == TEST_BUFFERS);
   assert(ef_vi_receive_init(&vi, ef_memreg_dma_addr(&mr, 0), 11) == 0);
@@ -91,7 +101,7 @@ int main(void)
   assert(ef_vi_filter_add(&vi, dh, &filter, NULL) == -EALREADY);
   assert(cookie.filter_id == 1);
 
-  const char message[] = "synthetic ITCH UDP message";
+  const char message[] = "raw socket integration datagram";
   assert(sendto(tx, message, sizeof(message), 0, (struct sockaddr *)&addr,
                 sizeof(addr)) == (ssize_t)sizeof(message));
   assert(wait_for_event(&vi, &ev) == 1);
@@ -157,6 +167,6 @@ int main(void)
   assert(ef_driver_close(dh) == 0);
   close(tx);
   free(mem);
-  puts("udp_integration: PASS");
+  puts("raw_integration: PASS");
   return 0;
 }
